@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import 'package:hive_flutter/adapters.dart';
+import 'package:path_provider/path_provider.dart';
 
 var box;
 
@@ -49,27 +50,233 @@ class MyHomePage extends StatefulWidget {
 
 class _MyHomePageState extends State<MyHomePage> {
 
-  File? selectedImage;
-  int rotated =0;
+  // Paths of the images, all copies stored in the app's private folder.
+  List<String> imagePaths = [];
+
+  // Rotation (in quarter turns) per image. Kept in memory only, on purpose.
+  final Map<String, int> rotations = {};
+
+  final PageController _pageController = PageController(viewportFraction: 0.88);
+  int currentPage = 0;
+  bool _adding = false;
 
   @override
   void initState() {
     super.initState();
+    _loadImages();
+  }
 
-    var imagePath = box.get('imagePath', defaultValue: null);
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
+  }
 
-    if(imagePath != null && selectedImage == null){
-      setState(() {
-        selectedImage = File(imagePath);
-      });
+  Future<void> _loadImages() async {
+    final saved = List<String>.from(box.get('imagePaths', defaultValue: <String>[]));
+
+    // Drop paths whose files no longer exist.
+    final existing = saved.where((p) => File(p).existsSync()).toList();
+    await box.put('imagePaths', existing);
+
+    if (!mounted) return;
+    setState(() {
+      imagePaths = existing;
+    });
+  }
+
+  // Copies a picked image into the app's private documents folder, so it
+  // doesn't depend on the picker's temporary cache. The folder is removed
+  // together with the app when it is uninstalled.
+  Future<String> _copyToAppStorage(String sourcePath, int index) async {
+    final docsDir = await getApplicationDocumentsDirectory();
+    final imagesDir = Directory('${docsDir.path}/images');
+    if (!await imagesDir.exists()) {
+      await imagesDir.create(recursive: true);
     }
 
+    // Grab the extension (".jpg", ".png"...) from the original path.
+    final dot = sourcePath.lastIndexOf('.');
+    final slash = sourcePath.lastIndexOf(RegExp(r'[\\/]'));
+    final extension = dot > slash ? sourcePath.substring(dot) : '';
+
+    // The new name is a timestamp + index, so every copy is unique.
+    final newPath = '${imagesDir.path}/${DateTime.now().microsecondsSinceEpoch}_$index$extension';
+    await File(sourcePath).copy(newPath);
+    return newPath;
+  }
+
+  Future<void> _savePaths() async {
+    await box.put('imagePaths', List<String>.from(imagePaths));
+  }
+
+  Future<void> _pickImages() async {
+    if (_adding) return;
+
+    final List<PlatformFile> files = await FilePicker.pickFiles(type: FileType.image);
+    if (files.isEmpty) return;
+
+    setState(() {
+      _adding = true;
+    });
+
+    final added = <String>[];
+    try {
+      for (final file in files) {
+        final path = file.path;
+        if (path == null) continue;
+        added.add(await _copyToAppStorage(path, added.length));
+      }
+    } catch (_) {
+      Fluttertoast.showToast(msg: 'Could not save some of the images',toastLength: Toast.LENGTH_SHORT,gravity: ToastGravity.BOTTOM);
+    }
+
+    if (!mounted) return;
+
+    final firstNewIndex = imagePaths.length;
+    setState(() {
+      imagePaths.addAll(added);
+      _adding = false;
+    });
+    await _savePaths();
+
+    // Show the first of the newly added images.
+    if (added.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_pageController.hasClients) {
+          _pageController.animateToPage(
+            firstNewIndex,
+            duration: const Duration(milliseconds: 300),
+            curve: Curves.easeOut,
+          );
+        }
+      });
+    }
+  }
+
+  Future<void> _deleteCurrentImage() async {
+    final index = currentPage;
+
+    if (index >= imagePaths.length) {
+      Fluttertoast.showToast(msg: 'No image saved to delete',toastLength: Toast.LENGTH_SHORT,gravity: ToastGravity.BOTTOM);
+      return;
+    }
+
+    final path = imagePaths[index];
+
+    // Deleting the last photo steps back to the previous one, otherwise the
+    // next photo slides into the same position.
+    final isLastPhoto = index == imagePaths.length - 1;
+    final newPage = (isLastPhoto && index > 0) ? index - 1 : index;
+    if (newPage != index) {
+      _pageController.jumpToPage(newPage);
+    }
+
+    setState(() {
+      imagePaths.removeAt(index);
+      rotations.remove(path);
+      currentPage = newPage;
+    });
+    await _savePaths();
+
+    try {
+      await File(path).delete();
+    } catch (_) {}
+  }
+
+  Widget _buildImageCard(String path) {
+    return Card(
+      key: ValueKey(path),
+      color: Colors.white,
+      elevation: 4,
+      margin: const EdgeInsets.symmetric(horizontal: 6.0, vertical: 8.0),
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      child: Padding(
+        padding: const EdgeInsets.all(8.0),
+        child: RotatedBox(
+          quarterTurns: rotations[path] ?? 0,
+          child: Image.file(
+            File(path),
+            fit: BoxFit.contain,
+            width: double.infinity,
+            height: double.infinity,
+            errorBuilder: (context, error, stackTrace) => const Center(
+              child: Icon(Icons.broken_image_outlined, size: 48),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAddCard() {
+    return Card(
+      color: Colors.white,
+      elevation: 4,
+      margin: const EdgeInsets.symmetric(horizontal: 6.0, vertical: 8.0),
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      child: InkWell(
+        onTap: _pickImages,
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.add_circle_outline,
+                size: 64,
+                color: Theme.of(context).colorScheme.primary,
+              ),
+              const SizedBox(height: 12),
+              Text(
+                imagePaths.isEmpty
+                    ? 'Please select an image to display'
+                    : 'Add more images',
+                style: TextStyle(
+                  fontSize: 16,
+                  color: Colors.grey[600],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // One dot per photo, plus one for the "+" page. The current page is
+  // shown as a longer, colored dot.
+  Widget _buildDots() {
+    final total = imagePaths.length + 1;
+    final primary = Theme.of(context).colorScheme.primary;
+
+    return Wrap(
+      alignment: WrapAlignment.center,
+      runSpacing: 6,
+      children: List.generate(total, (i) {
+        final active = i == currentPage;
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          margin: const EdgeInsets.symmetric(horizontal: 3),
+          width: active ? 18 : 8,
+          height: 8,
+          decoration: BoxDecoration(
+            color: active ? primary : Colors.grey[400],
+            borderRadius: BorderRadius.circular(4),
+          ),
+        );
+      }),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
 
     Size size = MediaQuery.of(context).size;
+
+    // True when the page on screen is a photo (and not the "+" card).
+    final bool onPhoto = currentPage < imagePaths.length;
 
     return Scaffold(
         appBar: AppBar(
@@ -83,39 +290,36 @@ class _MyHomePageState extends State<MyHomePage> {
 
               children: <Widget>[
 
-                selectedImage != null
-
-                    ?
+                if (_adding) const LinearProgressIndicator(),
 
                 Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 6.0),
-                    child: RotatedBox(
-                      quarterTurns: rotated,
-                      child: Image.file(selectedImage!, fit: BoxFit.contain, width: double.infinity, height: double.infinity),
-                    ),
-                  ),
-                )
-
-                    :
-
-                Padding(
-                  padding: const EdgeInsets.all(24.0),
-                  child: Text(
-                    'Please select an image to display',
-                    style: TextStyle(
-                      fontSize: 16,
-                      color: Colors.grey[600],
-                    ),
+                  child: PageView.builder(
+                    controller: _pageController,
+                    itemCount: imagePaths.length + 1,
+                    onPageChanged: (page) {
+                      setState(() {
+                        currentPage = page;
+                      });
+                    },
+                    itemBuilder: (context, index) {
+                      if (index == imagePaths.length) {
+                        return _buildAddCard();
+                      }
+                      return _buildImageCard(imagePaths[index]);
+                    },
                   ),
                 ),
 
-                SizedBox(height: size.height * 0.02),
+                SizedBox(height: size.height * 0.015),
+
+                _buildDots(),
+
+                SizedBox(height: size.height * 0.005),
 
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    selectedImage != null
+                    onPhoto
 
                         ?
 
@@ -132,7 +336,8 @@ class _MyHomePageState extends State<MyHomePage> {
                             ),
                             onPressed: () {
                               setState(() {
-                                rotated--;
+                                final path = imagePaths[currentPage];
+                                rotations[path] = (rotations[path] ?? 0) - 1;
                               });
                             },
                             child: const Icon(Icons.rotate_left)
@@ -153,18 +358,7 @@ class _MyHomePageState extends State<MyHomePage> {
                               foregroundColor: Colors.white,
                               elevation: 2,
                             ),
-                            onPressed: () async{
-                              PlatformFile? result = await FilePicker.pickFile(
-                                  type: FileType.image
-                              );
-
-                              if (result != null) {
-                                setState(() {
-                                  selectedImage = File(result.path!);
-                                  box.put('imagePath', selectedImage!.path);
-                                });
-                              }
-                            },
+                            onPressed: _pickImages,
                             child: const Icon(Icons.image)
                         ),
                       ),
@@ -181,25 +375,13 @@ class _MyHomePageState extends State<MyHomePage> {
                               foregroundColor: Colors.redAccent,
                               elevation: 2,
                             ),
-                            onPressed: () async{
-
-                              setState(() {
-                                if(selectedImage !=null){
-                                  selectedImage = null;
-                                  box.put('imagePath', null);
-                                }
-                                else{
-                                  Fluttertoast.showToast(msg: 'No image saved to delete',toastLength: Toast.LENGTH_SHORT,gravity: ToastGravity.BOTTOM);
-                                }
-                              });
-
-                            },
+                            onPressed: _deleteCurrentImage,
                             child: const Icon(Icons.delete_forever)
                         ),
                       ),
                     ),
 
-                    selectedImage != null
+                    onPhoto
 
                         ?
 
@@ -216,7 +398,8 @@ class _MyHomePageState extends State<MyHomePage> {
                             ),
                             onPressed: () {
                               setState(() {
-                                rotated++;
+                                final path = imagePaths[currentPage];
+                                rotations[path] = (rotations[path] ?? 0) + 1;
                               });
                             },
                             child: const Icon(Icons.rotate_right)
