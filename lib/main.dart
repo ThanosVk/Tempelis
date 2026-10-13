@@ -184,9 +184,41 @@ class _MyHomePageState extends State<MyHomePage> {
     } catch (_) {}
   }
 
+  // Opens the photo in fullscreen. Double tap on the fullscreen page (or the
+  // system back button) closes it again.
+  Future<void> _openFullscreen(String path) async {
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    if (!mounted) return;
+
+    await Navigator.of(context).push(
+      PageRouteBuilder(
+        opaque: true,
+        transitionDuration: const Duration(milliseconds: 200),
+        reverseTransitionDuration: const Duration(milliseconds: 200),
+        pageBuilder: (context, animation, secondaryAnimation) => FadeTransition(
+          opacity: animation,
+          child: _FullscreenImage(
+            path: path,
+            quarterTurns: rotations[path] ?? 0,
+          ),
+        ),
+      ),
+    );
+
+    // Back from fullscreen: bring the status/navigation bars back.
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+  }
+
   Widget _buildImageCard(String path) {
-    return Card(
+    return GestureDetector(
       key: ValueKey(path),
+      onDoubleTap: () => _openFullscreen(path),
+      child: _buildImageCardBody(path),
+    );
+  }
+
+  Widget _buildImageCardBody(String path) {
+    return Card(
       color: Colors.white,
       elevation: 4,
       margin: const EdgeInsets.symmetric(horizontal: 6.0, vertical: 8.0),
@@ -418,6 +450,44 @@ class _MyHomePageState extends State<MyHomePage> {
             ),
           ),
         )
+    );
+  }
+}
+
+// Fullscreen viewer: black background, pinch to zoom, double tap to close.
+class _FullscreenImage extends StatelessWidget {
+  final String path;
+  final int quarterTurns;
+
+  const _FullscreenImage({required this.path, required this.quarterTurns});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onDoubleTap: () => Navigator.of(context).pop(),
+        child: SizedBox.expand(
+          child: InteractiveViewer(
+            minScale: 1.0,
+            maxScale: 5.0,
+            child: RotatedBox(
+              quarterTurns: quarterTurns,
+              child: Image.file(
+                File(path),
+                fit: BoxFit.contain,
+                width: double.infinity,
+                height: double.infinity,
+                errorBuilder: (context, error, stackTrace) => const Center(
+                  child: Icon(Icons.broken_image_outlined,
+                      size: 48, color: Colors.white54),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
